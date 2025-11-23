@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 import struct
+import plotly.graph_objects as go
+from Functions.Plot import plot_wireframe, plot_surface
+from tqdm import tqdm
 
 class Workpiece:
     def __init__(self, zs: list[float], xs: list[float]):
@@ -9,35 +12,77 @@ class Workpiece:
             xs = xs[::-1]
         self.zs_1d = zs
         self.xs_1d = xs
-        self.Ps_2d = np.vstack((zs, xs)).T
-        self.x_from_z = lambda z: np.interp(z, self.zs_1d, self.xs_1d)
+        self.Ps_1d = np.vstack((zs, xs)).T
+
+        if self.zs_1d[0] > self.zs_1d[-1]:
+            self.x_from_z = lambda z: np.interp(z, self.zs_1d[::-1], self.xs_1d[::-1])
+        else:
+            self.x_from_z = lambda z: np.interp(z, self.zs_1d, self.xs_1d)
+
+    def plot_3d(self,fig=None,n_thetas=60):
+        if fig is None:
+            fig = go.Figure()
+
+        thetas_1d = np.linspace(0, 2 * np.pi, n_thetas)
+        zs_2d, thetas_2d = np.meshgrid(self.zs_1d, thetas_1d)
+        rs_2d = np.tile(self.xs_1d, (n_thetas, 1))
+        xs_2d = rs_2d * np.cos(thetas_2d)
+        ys_2d = rs_2d * np.sin(thetas_2d)
+
+        plot_wireframe(xs_2d, ys_2d, zs_2d, fig=fig, linecolor="rgba(255,255,255,0.2)")
+
+        return fig
 
 class Toolpath:
-    def __init__(self, zs: list[float], xs: list[float], z_min = None, z_max = None):
+    def __init__(self, zs: list[float], xs: list[float], z_min = None, z_max = None, dz_forced = None):
         if z_min:
-            zs = [z for z in zs if z >= z_min]
-            xs = xs[-len(zs):]
+            xs = xs[zs>=z_min]
+            zs = zs[zs>=z_min]
         if z_max:
-            zs = [z for z in zs if z <= z_max]
-            xs = xs[:len(zs)]
+            xs = xs[zs <= z_max]
+            zs = zs[zs <= z_max]
+        if dz_forced: # resample to uniform dz
+            z_new = np.linspace(np.max(zs), np.min(zs), int((np.max(zs)-np.min(zs))/dz_forced)+1)
+            if z_new[0] > z_new[-1]:
+                x_new = np.interp(z_new, zs[::-1], xs[::-1])
+            else:
+                x_new = np.interp(z_new, zs, xs)
+            zs = z_new
+            xs = x_new
+        if zs[0] < zs[-1]:
+            zs = zs[::-1]
+            xs = xs[::-1]
         self.zs_1d = zs
         self.xs_1d = xs
-        self.Ps_2d = np.vstack((zs, xs)).T
+        self.Ps_1d = np.vstack((zs, xs)).T
+
+    def plot_3d(self, fig=None):
+        if fig is None:
+            fig = go.Figure()
+
+        fig.add_trace(go.Scatter3d(x=self.xs_1d, y=np.zeros_like(self.xs_1d), z=self.zs_1d,
+                                   mode="lines+markers",
+                                   line=dict(color="cyan", width=2),
+                                   marker=dict(size=3, color="cyan"),
+                                   name="Toolpath"))
 
 class Tool:
     def __init__(self,
                  z_min: float,
                  z_max: float,
                  dz_tool: float,
-                 tool_tip_x0: float,
-                 tool_tip_z0: float,
+                 tool_CL_x0: float,
+                 tool_CL_z0: float,
                  tool_radius_init: float,
                  n_phi: int):
-        self.z_min = z_min
-        self.z_max = z_max
+
+        if z_max >= z_min:
+            self.z_min, self.z_max = z_max, z_min
+        else:
+            self.z_min, self.z_max = z_min, z_max
         self.dz_tool = dz_tool
-        self.tool_tip_x0 = tool_tip_x0
-        self.tool_tip_z0 = tool_tip_z0
+        self.tool_CL_x0 = tool_CL_x0
+        self.tool_CL_z0 = tool_CL_z0
         self.tool_radius_init = tool_radius_init
         self.n_phi = n_phi
 
@@ -45,64 +90,242 @@ class Tool:
 
     def initialize_geometry(self):
         self.phis_1d = np.linspace(0, 2 * np.pi, self.n_phi, endpoint=True)
-        self.zs_1d = np.linspace(self.z_min, self.z_max, int((self.z_max - self.z_min) / self.dz_tool) + 1)
+        self.zs_1d = np.arange(self.z_min, self.z_max + self.dz_tool, -self.dz_tool)
         self.phis_2d, self.zs_2d = np.meshgrid(self.phis_1d, self.zs_1d)
         self.rs_2d = np.ones_like(self.zs_2d) * self.tool_radius_init
 
-    def z_at_position(self, tip_pos_z: float, type):
-        dz = tip_pos_z - self.tool_tip_z0
-        if type == '1d':
-            return self.zs_1d + dz
-        elif type == '2d':
-            return self.zs_2d + dz
+    def export_as_stl(self, path=None, solid_name="tool"):
+        """
+        Export the tool surface as a very simple ASCII STL.
+        Only the lateral surface is exported (no end caps).
+        """
+        if path is None:
+            path = "tool.stl"
 
-def compute_single_distance(z: float,
-                            tool_axis_x: float,
+        # Coordinates in tool frame (no CL offset here, keep it simple)
+        xs = self.rs_2d * np.cos(self.phis_2d)
+        ys = self.rs_2d * np.sin(self.phis_2d)
+        zs = self.zs_2d
+
+        # Remove last phi column (2π) to avoid duplicate seam
+        xs = xs[:, :-1]
+        ys = ys[:, :-1]
+        zs = zs[:, :-1]
+
+        n_z, n_phi = xs.shape
+
+        def write_facet(f, v0, v1, v2):
+            # Compute normal from triangle vertices
+            v0 = np.array(v0)
+            v1 = np.array(v1)
+            v2 = np.array(v2)
+            n = np.cross(v1 - v0, v2 - v0)
+            norm = np.linalg.norm(n)
+            if norm > 0:
+                n = n / norm
+            else:
+                n = np.array([0.0, 0.0, 0.0])
+
+            f.write(f"  facet normal {n[0]} {n[1]} {n[2]}\n")
+            f.write("    outer loop\n")
+            f.write(f"      vertex {v0[0]} {v0[1]} {v0[2]}\n")
+            f.write(f"      vertex {v1[0]} {v1[1]} {v1[2]}\n")
+            f.write(f"      vertex {v2[0]} {v2[1]} {v2[2]}\n")
+            f.write("    endloop\n")
+            f.write("  endfacet\n")
+
+        with open(path, "w") as f:
+            f.write(f"solid {solid_name}\n")
+
+            # Build quads between z_i and z_{i+1}, then split into 2 triangles
+            for i in range(n_z - 1):
+                for j in range(n_phi):
+                    j_next = (j + 1) % n_phi
+
+                    v00 = (xs[i, j],     ys[i, j],     zs[i, j])
+                    v01 = (xs[i, j_next], ys[i, j_next], zs[i, j_next])
+                    v10 = (xs[i+1, j],   ys[i+1, j],   zs[i+1, j])
+                    v11 = (xs[i+1, j_next], ys[i+1, j_next], zs[i+1, j_next])
+
+                    # Triangle 1
+                    write_facet(f, v00, v10, v11)
+                    # Triangle 2
+                    write_facet(f, v00, v11, v01)
+
+            f.write(f"endsolid {solid_name}\n")
+
+    def plot_3d(self,fig=None,n_thetas=120,CL_xz = (0,0)):
+        if fig is None:
+            fig = go.Figure()
+
+        xs_2d = self.rs_2d * np.cos(self.phis_2d) + (CL_xz[0]-self.tool_CL_x0)
+        ys_2d = self.rs_2d * np.sin(self.phis_2d)
+        zs_2d = self.zs_2d + (CL_xz[1]-self.tool_CL_z0)
+
+        plot_surface(xs_2d, ys_2d, zs_2d, fig=fig)
+        plot_wireframe(xs_2d, ys_2d, zs_2d, fig=fig, linecolor="rgba(0,0,0,1)")
+
+        # plot tool tip
+        fig.add_trace(go.Scatter3d(x=[CL_xz[0]], y=[0], z=[CL_xz[1]],mode="markers",marker=dict(color="red",size=5),name="Tool Tip"))
+
+        # plot tool axis
+        fig.add_trace(go.Scatter3d(x=[CL_xz[0]-self.tool_CL_x0, CL_xz[0]-self.tool_CL_x0],
+                                   y=[0,0],
+                                   z=[self.z_min + (CL_xz[1]-self.tool_CL_z0), self.z_max + (CL_xz[1]-self.tool_CL_z0)],
+                                   mode="lines", line=dict(color="yellow", width=3), name="Tool Axis"))
+
+
+        return fig
+
+import numpy as np
+from typing import Optional
+
+"""def compute_single_distance(tool_axis_x: float,
                             phi: float,
-                            wp: Workpiece) -> float:
+                            R: float) -> Optional[float]:
+    if R > abs(tool_axis_x * np.cos(phi)):
+        d = -tool_axis_x*np.cos(phi)+(R**2-tool_axis_x**2*np.sin(phi)**2)**0.5
+        if d<0:
+            print("Warning: negative distance computed!")
+            return None
+        return d
+    else:
+        return None"""
+
+import numpy as np
+from typing import Optional
+
+def compute_single_distance(tool_axis_x: float,
+                                phi: float,
+                                R: float) -> Optional[float]:
+    x0 = tool_axis_x
+    y0 = 0.0
+
+    ux = np.cos(phi)
+    uy = np.sin(phi)
+
+    # 1) Distance from origin to infinite line through (x0, 0) along (ux, uy)
+    #    d_min = |P0 x u| in 2D
+    d_min = abs(x0 * uy)  # since y0 = 0
+
+    # If the line misses the circle, the ray also misses.
+    if d_min > R:
+        return None
+
+    # 2) Parameter of closest approach along the ray
+    p0_dot_u = x0 * ux + y0 * uy  # = x0 * cos(phi)
+    t_star = -p0_dot_u
+
+    # Squared distance at closest approach
+    d_min_sq = x0 * x0 - p0_dot_u * p0_dot_u
+
+    # Safety check (should be consistent with d_min > R check)
+    if d_min_sq > R * R:
+        return None
+
+    # 3) Offset from closest approach to intersection(s)
+    offset = np.sqrt(R * R - d_min_sq)
+
+    # Two intersection parameters along the ray
+    t1 = t_star - offset
+    t2 = t_star + offset
+
+    # We only care about intersections in front of the starting point (t >= 0)
+    candidates = [t for t in (t1, t2) if t >= 0]
+
+    if not candidates:
+        return None
+
+    d = min(candidates)
+
+    # Additional sanity check
+    if d < 0:
+        print("Warning: negative distance computed!")
+        return None
+
+    return d
 
 
-def compute_distances(tool: Tool, tp: Toolpath, wp: Workpiece):
-    for tip_pos in tp.Ps_2d:   # rows are (z, x)
-        tip_z, tip_x = tip_pos
 
-        # tool axis X in workpiece frame
-        axis_x = tip_x - tool.tool_tip_x0
+def compute_distances_and_update_tool(tool: Tool, tp: Toolpath, wp: Workpiece):
+    for CL_pos in tqdm(tp.Ps_1d):   # rows are (z, x)
+        CL_z, CL_x = CL_pos
 
-        # Z of each tool station in workpiece frame
-        tool_zs_1d = tool.z_at_position(tip_z, type='1d')
-
+        tool_zs_1d = tool.zs_1d + (CL_z - tool.tool_CL_z0)
         for tool_z_idx, tool_zi in enumerate(tool_zs_1d):
             # optional: skip if outside wp range
-            if tool_zi < wp.zs_1d[-1] or tool_zi > wp.zs_1d[0]:
+            if tool_zi < np.amin(wp.zs_1d) or tool_zi > np.amax(wp.zs_1d):
                 continue
 
             for phi_idx, tool_phii in enumerate(tool.phis_1d):
-                r_allowed = compute_single_distance(
-                    z=tool_zi,
-                    tool_axis_x=axis_x,
-                    phi=tool_phii,
-                    wp=wp
-                )
-                if r_allowed < tool.rs_2d[tool_z_idx, phi_idx]:
-                    tool.rs_2d[tool_z_idx, phi_idx] = r_allowed
+
+                r_allowed = compute_single_distance(tool_axis_x=CL_x-tool.tool_CL_x0,phi=tool_phii,R = wp.x_from_z(tool_zi))
+                if r_allowed:
+                    if r_allowed < tool.rs_2d[tool_z_idx, phi_idx]:
+                        tool.rs_2d[tool_z_idx, phi_idx] = r_allowed
 
 
 if __name__ == "__main__":
 
-    wp_df = pd.read_csv(r".\data\AD_HORN\Profile__ST0667014_01_AA.02_converted_20221112061505.csv")
-    wp_z = wp_df["Z"].to_numpy()
-    wp_x = wp_df["X"].to_numpy()
-    wp = Workpiece(wp_z, wp_x)
+    PLOT = True
+    EXPORT_STL = True
+    EXPORT_plot = True
 
-    tool = Tool(z_min=0,z_max=100,dz_tool=0.5,
-                tool_tip_x0= 3,tool_tip_z0 = 0,
-                tool_radius_init = 100,
-                n_phi = 120)
+    MIRROR_WP_YZ = True
 
-    tp = Toolpath(zs=wp_z,xs=wp_x,z_min=-189)
-    compute_distances(tool, tp, wp)
+    tool = Tool(z_min=0, z_max=200, dz_tool=0.5,
+                tool_CL_x0=3, tool_CL_z0=0,
+                tool_radius_init=40,
+                n_phi=30)
 
-    compute_distances(tool, tp, wp)
+    for MIRROR_WP_YZ in [False, True]:
+        wp_df = pd.read_csv(r".\data\AD_HORN\Profile__ST0667014_01_AA.02_converted_20221112061505.csv")
+        wp_z = wp_df["Z"].to_numpy()
+        wp_x = -wp_df["X"].to_numpy()
+        #remove points with same Z:
+        _, unique_indices = np.unique(wp_z, return_index=True)
+        wp_z = wp_z[unique_indices]
+        wp_x = wp_x[unique_indices]
 
-    export_tool_stl(tool, filename="tool_envelope.stl", origin=(0.0, 0.0, 0.0))
+        if MIRROR_WP_YZ:
+            wp_z = -wp_z
+            z_end_simulation = -161
+        else:
+            z_end_simulation = -189
+
+        wp_z = wp_z - np.max(wp_z)
+        wp = Workpiece(wp_z, wp_x)
+
+
+
+
+        tp = Toolpath(zs=wp_z,xs=wp_x,z_min=z_end_simulation, dz_forced=.5)#
+
+        if PLOT:
+            fig = wp.plot_3d()
+            compute_distances_and_update_tool(tool, tp, wp)
+
+
+            fig.add_trace(go.Scatter3d(x=[wp.x_from_z(z_end_simulation)], y=[0], z=[z_end_simulation], mode="markers", marker=dict(color="red", size=5),
+                                       name="Tool Tip"))
+
+            fig = tool.plot_3d(fig=fig, CL_xz = (wp.x_from_z(z_end_simulation) , z_end_simulation))
+            tp.plot_3d(fig=fig)
+
+            layout = go.Layout(
+                template="plotly_dark",
+                scene=dict(
+                    aspectmode='data'
+                ),
+                scene_camera=dict(
+                    eye=dict(x=0, y=2.5, z=0),  # Looking along +y toward the origin
+                    up=dict(x=1, y=0, z=0)  # Make x point upward on the screen
+                ),
+            )
+            fig.update_layout(layout)
+            fig.show(renderer="browser")
+            if EXPORT_plot:
+                fig.write_html(file=f"./data/AD_HORN/tool{"_side2" if MIRROR_WP_YZ else ""}.html", include_plotlyjs="cdn")
+
+        if EXPORT_STL:
+            tool.export_as_stl(path=f"./data/AD_HORN/tool{"_side2" if MIRROR_WP_YZ else ""}.stl", solid_name="AD_HORN_tool")
