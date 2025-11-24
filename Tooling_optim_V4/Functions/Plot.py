@@ -16,10 +16,12 @@ def plot_wireframe(xs_2d, ys_2d, zs_2d, fig=None, linecolor="rgba(255,255,255,0.
     return fig
 
 
-def plot_surface(xs_2d, ys_2d, zs_2d, fig=None, colorscale="Viridis", opacity=0.8):
+def plot_surface(xs_2d, ys_2d, zs_2d, fig=None, colorscale="RdBu", opacity=0.8):
     if fig is None:
         fig = go.Figure()
 
-    fig.add_trace(go.Surface(x=xs_2d, y=ys_2d, z=zs_2d, surfacecolor= (xs_2d**2+ys_2d**2)**0.5,colorscale=colorscale, opacity=opacity, showscale=False))
+    color = (xs_2d ** 2 + ys_2d ** 2) ** 0.5
+    color = (color - np.min(color)) / (np.max(color) - np.min(color))
+    fig.add_trace(go.Surface(x=xs_2d, y=ys_2d, z=zs_2d, surfacecolor= color,colorscale=colorscale, opacity=opacity, showscale=False))
 
     return fig

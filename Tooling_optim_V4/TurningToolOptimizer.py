@@ -1,9 +1,17 @@
+##########################
+### IMPORTS ###
+##########################
+
+from typing import Optional
 import pandas as pd
 import numpy as np
-import struct
+from tqdm import tqdm
 import plotly.graph_objects as go
 from Functions.Plot import plot_wireframe, plot_surface
-from tqdm import tqdm
+
+##########################
+### CLASSES ###
+##########################
 
 class Workpiece:
     def __init__(self, zs: list[float], xs: list[float]):
@@ -42,16 +50,13 @@ class Toolpath:
             xs = xs[zs <= z_max]
             zs = zs[zs <= z_max]
         if dz_forced: # resample to uniform dz
-            z_new = np.linspace(np.max(zs), np.min(zs), int((np.max(zs)-np.min(zs))/dz_forced)+1)
-            if z_new[0] > z_new[-1]:
+            z_new = np.linspace(np.max(zs), np.min(zs), np.abs(int((np.max(zs)-np.min(zs))/dz_forced))+1)
+            if zs[0] > zs[-1]:
                 x_new = np.interp(z_new, zs[::-1], xs[::-1])
             else:
                 x_new = np.interp(z_new, zs, xs)
             zs = z_new
             xs = x_new
-        if zs[0] < zs[-1]:
-            zs = zs[::-1]
-            xs = xs[::-1]
         self.zs_1d = zs
         self.xs_1d = xs
         self.Ps_1d = np.vstack((zs, xs)).T
@@ -62,8 +67,8 @@ class Toolpath:
 
         fig.add_trace(go.Scatter3d(x=self.xs_1d, y=np.zeros_like(self.xs_1d), z=self.zs_1d,
                                    mode="lines+markers",
-                                   line=dict(color="cyan", width=2),
-                                   marker=dict(size=3, color="cyan"),
+                                   line=dict(color="rgba(0,120,0,0.5)", width=2),
+                                   marker=dict(size=2, color="rgba(0,120,0,1)"),
                                    name="Toolpath"))
 
 class Tool:
@@ -166,7 +171,7 @@ class Tool:
         plot_wireframe(xs_2d, ys_2d, zs_2d, fig=fig, linecolor="rgba(0,0,0,1)")
 
         # plot tool tip
-        fig.add_trace(go.Scatter3d(x=[CL_xz[0]], y=[0], z=[CL_xz[1]],mode="markers",marker=dict(color="red",size=5),name="Tool Tip"))
+        fig.add_trace(go.Scatter3d(x=[CL_xz[0]], y=[0], z=[CL_xz[1]],mode="markers",marker=dict(color="red",size=3),name="Tool Tip"))
 
         # plot tool axis
         fig.add_trace(go.Scatter3d(x=[CL_xz[0]-self.tool_CL_x0, CL_xz[0]-self.tool_CL_x0],
@@ -177,155 +182,88 @@ class Tool:
 
         return fig
 
-import numpy as np
-from typing import Optional
-
-"""def compute_single_distance(tool_axis_x: float,
-                            phi: float,
-                            R: float) -> Optional[float]:
-    if R > abs(tool_axis_x * np.cos(phi)):
-        d = -tool_axis_x*np.cos(phi)+(R**2-tool_axis_x**2*np.sin(phi)**2)**0.5
-        if d<0:
-            print("Warning: negative distance computed!")
-            return None
-        return d
-    else:
-        return None"""
-
-import numpy as np
-from typing import Optional
+##########################
+### MATHS FUNCTIONS ###
+##########################
 
 def compute_single_distance(tool_axis_x: float,
                                 phi: float,
                                 R: float) -> Optional[float]:
-    x0 = tool_axis_x
-    y0 = 0.0
 
-    ux = np.cos(phi)
-    uy = np.sin(phi)
+    method = 1
 
-    # 1) Distance from origin to infinite line through (x0, 0) along (ux, uy)
-    #    d_min = |P0 x u| in 2D
-    d_min = abs(x0 * uy)  # since y0 = 0
-
-    # If the line misses the circle, the ray also misses.
-    if d_min > R:
-        return None
-
-    # 2) Parameter of closest approach along the ray
-    p0_dot_u = x0 * ux + y0 * uy  # = x0 * cos(phi)
-    t_star = -p0_dot_u
-
-    # Squared distance at closest approach
-    d_min_sq = x0 * x0 - p0_dot_u * p0_dot_u
-
-    # Safety check (should be consistent with d_min > R check)
-    if d_min_sq > R * R:
-        return None
-
-    # 3) Offset from closest approach to intersection(s)
-    offset = np.sqrt(R * R - d_min_sq)
-
-    # Two intersection parameters along the ray
-    t1 = t_star - offset
-    t2 = t_star + offset
-
-    # We only care about intersections in front of the starting point (t >= 0)
-    candidates = [t for t in (t1, t2) if t >= 0]
-
-    if not candidates:
-        return None
-
-    d = min(candidates)
-
-    # Additional sanity check
-    if d < 0:
-        print("Warning: negative distance computed!")
-        return None
-
-    return d
-
-
-
-def compute_distances_and_update_tool(tool: Tool, tp: Toolpath, wp: Workpiece):
-    for CL_pos in tqdm(tp.Ps_1d):   # rows are (z, x)
-        CL_z, CL_x = CL_pos
-
-        tool_zs_1d = tool.zs_1d + (CL_z - tool.tool_CL_z0)
-        for tool_z_idx, tool_zi in enumerate(tool_zs_1d):
-            # optional: skip if outside wp range
-            if tool_zi < np.amin(wp.zs_1d) or tool_zi > np.amax(wp.zs_1d):
-                continue
-
-            for phi_idx, tool_phii in enumerate(tool.phis_1d):
-
-                r_allowed = compute_single_distance(tool_axis_x=CL_x-tool.tool_CL_x0,phi=tool_phii,R = wp.x_from_z(tool_zi))
-                if r_allowed:
-                    if r_allowed < tool.rs_2d[tool_z_idx, phi_idx]:
-                        tool.rs_2d[tool_z_idx, phi_idx] = r_allowed
-
-
-if __name__ == "__main__":
-
-    PLOT = True
-    EXPORT_STL = True
-    EXPORT_plot = True
-
-    MIRROR_WP_YZ = True
-
-    tool = Tool(z_min=0, z_max=200, dz_tool=0.5,
-                tool_CL_x0=3, tool_CL_z0=0,
-                tool_radius_init=40,
-                n_phi=30)
-
-    for MIRROR_WP_YZ in [False, True]:
-        wp_df = pd.read_csv(r".\data\AD_HORN\Profile__ST0667014_01_AA.02_converted_20221112061505.csv")
-        wp_z = wp_df["Z"].to_numpy()
-        wp_x = -wp_df["X"].to_numpy()
-        #remove points with same Z:
-        _, unique_indices = np.unique(wp_z, return_index=True)
-        wp_z = wp_z[unique_indices]
-        wp_x = wp_x[unique_indices]
-
-        if MIRROR_WP_YZ:
-            wp_z = -wp_z
-            z_end_simulation = -161
+    if method == 1:
+        if R > abs(tool_axis_x * np.cos(phi)):
+            d = -tool_axis_x * np.cos(phi) + (R ** 2 - tool_axis_x ** 2 * np.sin(phi) ** 2) ** 0.5
+            if d < 0:
+                print("Warning: negative distance computed!")
+                return None
+            return d
         else:
-            z_end_simulation = -189
+            return None
+    elif method==2:
 
-        wp_z = wp_z - np.max(wp_z)
-        wp = Workpiece(wp_z, wp_x)
+        x0 = tool_axis_x
+        y0 = 0.0
+
+        ux = np.cos(phi)
+        uy = np.sin(phi)
+
+        # 1) Distance from origin to infinite line through (x0, 0) along (ux, uy)
+        #    d_min = |P0 x u| in 2D
+        d_min = abs(x0 * uy)  # since y0 = 0
+
+        # If the line misses the circle, the ray also misses.
+        if d_min > R:
+            return None
+
+        # 2) Parameter of closest approach along the ray
+        p0_dot_u = x0 * ux + y0 * uy  # = x0 * cos(phi)
+        t_star = -p0_dot_u
+
+        # Squared distance at closest approach
+        d_min_sq = x0 * x0 - p0_dot_u * p0_dot_u
+
+        # Safety check (should be consistent with d_min > R check)
+        if d_min_sq > R * R:
+            return None
+
+        # 3) Offset from closest approach to intersection(s)
+        offset = np.sqrt(R * R - d_min_sq)
+
+        # Two intersection parameters along the ray
+        t1 = t_star - offset
+        t2 = t_star + offset
+
+        # We only care about intersections in front of the starting point (t >= 0)
+        candidates = [t for t in (t1, t2) if t >= 0]
+
+        if not candidates:
+            return None
+
+        d = min(candidates)
+
+        # Additional sanity check
+        if d < 0:
+            print("Warning: negative distance computed!")
+            return None
+
+        return d
 
 
 
+def compute_distances_and_update_tool(tool: Tool, CL_pos, wp: Workpiece):
+    CL_z, CL_x = CL_pos
 
-        tp = Toolpath(zs=wp_z,xs=wp_x,z_min=z_end_simulation, dz_forced=.5)#
+    tool_zs_1d = tool.zs_1d + (CL_z - tool.tool_CL_z0)
+    for tool_z_idx, tool_zi in enumerate(tool_zs_1d):
+        # optional: skip if outside wp range
+        if tool_zi < np.amin(wp.zs_1d) or tool_zi > np.amax(wp.zs_1d):
+            continue
 
-        if PLOT:
-            fig = wp.plot_3d()
-            compute_distances_and_update_tool(tool, tp, wp)
+        for phi_idx, tool_phii in enumerate(tool.phis_1d):
 
-
-            fig.add_trace(go.Scatter3d(x=[wp.x_from_z(z_end_simulation)], y=[0], z=[z_end_simulation], mode="markers", marker=dict(color="red", size=5),
-                                       name="Tool Tip"))
-
-            fig = tool.plot_3d(fig=fig, CL_xz = (wp.x_from_z(z_end_simulation) , z_end_simulation))
-            tp.plot_3d(fig=fig)
-
-            layout = go.Layout(
-                template="plotly_dark",
-                scene=dict(
-                    aspectmode='data'
-                ),
-                scene_camera=dict(
-                    eye=dict(x=0, y=2.5, z=0),  # Looking along +y toward the origin
-                    up=dict(x=1, y=0, z=0)  # Make x point upward on the screen
-                ),
-            )
-            fig.update_layout(layout)
-            fig.show(renderer="browser")
-            if EXPORT_plot:
-                fig.write_html(file=f"./data/AD_HORN/tool{"_side2" if MIRROR_WP_YZ else ""}.html", include_plotlyjs="cdn")
-
-        if EXPORT_STL:
-            tool.export_as_stl(path=f"./data/AD_HORN/tool{"_side2" if MIRROR_WP_YZ else ""}.stl", solid_name="AD_HORN_tool")
+            r_allowed = compute_single_distance(tool_axis_x=CL_x-tool.tool_CL_x0,phi=tool_phii,R = wp.x_from_z(tool_zi))
+            if r_allowed:
+                if r_allowed < tool.rs_2d[tool_z_idx, phi_idx]:
+                    tool.rs_2d[tool_z_idx, phi_idx] = r_allowed
